@@ -1,12 +1,11 @@
 package com.integration.em.blocker;
 
+import com.integration.em.aggregator.CountAggregator;
 import com.integration.em.aggregator.SetAggregator;
 import com.integration.em.aggregator.SumDoubleAggregator;
 import com.integration.em.blocker.generators.BlockingKeyGenerator;
-import com.integration.em.model.Aligner;
-import com.integration.em.model.DataSet;
-import com.integration.em.model.LeftIdentityPair;
-import com.integration.em.model.Matchable;
+import com.integration.em.model.*;
+import com.integration.em.model.Record;
 import com.integration.em.processing.*;
 import com.integration.em.similarity.VectorSpaceSimilarity;
 import com.integration.em.tables.Pair;
@@ -55,9 +54,179 @@ public class BlockingKeyIndexer<RecordType extends Matchable, SchemaElementType 
 
     @Override
     public Processable<Aligner<BlockedType, AlignerType>> createBlocking(DataSet<RecordType, SchemaElementType> dataset1, DataSet<RecordType, SchemaElementType> dataset2, Processable<Aligner<AlignerType, Matchable>> schemaAligner) {
-        return null;
+
+        Processable<Pair<RecordType, Processable<Aligner<AlignerType, Matchable>>>> ds1 = combineDataWithAligner(
+                dataset1, schemaAligner,
+                (r, c) -> c.next(new Pair<>(r.getFirstRecordType().getDataSourceIdentifier(), r)));
+        Processable<Pair<RecordType, Processable<Aligner<AlignerType, Matchable>>>> ds2 = combineDataWithAligner(
+                dataset2, schemaAligner,
+                (r, c) -> c.next(new Pair<>(r.getSecondRecordType().getDataSourceIdentifier(), r)));
+
+        log.info("Creating blocking key value vectors");
+        Processable<Pair<BlockedType, BlockingVector>> vectors1 = createBlockingVectors(ds1, blockedTypeBlockingKeyGenerator);
+        Processable<Pair<BlockedType, BlockingVector>> vectors2 = createBlockingVectors(ds2, secondBlockedTypeBlockingKeyGenerator);
+
+        log.info("Creating inverted index");
+        Processable<Block> blocks1 = createInvertedIndex(vectors1);
+        Processable<Block> blocks2 = createInvertedIndex(vectors2);
+
+        if (vectorCreationMethod == VectorCreationMethod.TFIDF) {
+            log.info("Calculating TFIDF vectors");
+
+            if(documentFrequencyCounter!=DocumentFrequencyCounter.Preset || inverseDocumentFrequencies==null) {
+                Processable<Pair<String, Double>> documentFrequencies = createDocumentFrequencies(blocks1, blocks2, documentFrequencyCounter);
+                int documentCount = getDocumentCount(vectors1, vectors2, documentFrequencyCounter);
+                inverseDocumentFrequencies = createIDF(documentFrequencies, documentCount);
+            }
+
+            vectors1 = createTFIDFVectors(vectors1, inverseDocumentFrequencies);
+            vectors2 = createTFIDFVectors(vectors2, inverseDocumentFrequencies);
+
+        }
+
+        log.info("Creating record pairs");
+        Processable<Triple<String, BlockedType, BlockedType>> pairs = blocks1.join(blocks2, new BlockJoinKeyGenerator())
+                .map((Pair<BlockingKeyIndexer<RecordType, SchemaElementType, BlockedType, AlignerType>.Block, BlockingKeyIndexer<RecordType, SchemaElementType, BlockedType, AlignerType>.Block> record,
+                      DataIterator<Triple<String, BlockedType, BlockedType>> resultCollector) -> {
+
+                    Block leftBlock = record.getFirst();
+                    Block rightBlock = record.getSecond();
+
+                    for (BlockedType leftRecord : leftBlock.getSecond()) {
+                        for (BlockedType rightRecord : rightBlock.getSecond()) {
+
+                            resultCollector.next(new Triple<>(record.getFirst().getFirst(), leftRecord, rightRecord));
+
+                        }
+                    }
+                });
+
+        if (this.isMeasureBlockSizes()) {
+            measureBlockSizes(pairs);
+        }
+
+        log.info("Joining record pairs with vectors");
+        Processable<Triple<String, Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>>> pairsWithVectors = pairs
+                .join(vectors1, (t) -> t.getSecond(), (p) -> p.getFirst())
+                .join(vectors2, (p) -> p.getFirst().getThird(), (p) -> p.getFirst())
+                .map((Pair<Pair<Triple<String, BlockedType, BlockedType>, Pair<BlockedType, BlockingVector>>, Pair<BlockedType, BlockingVector>> record,
+                      DataIterator<Triple<String, Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>>> resultCollector) -> {
+                    resultCollector.next(new Triple<>(record.getFirst().getFirst().getFirst(),
+                            record.getFirst().getSecond(), record.getSecond()));
+                });
+
+        log.info("Aggregating record pairs");
+        return createAligners(pairsWithVectors);
+
     }
 
+    protected void measureBlockSizes(Processable<Triple<String, BlockedType, BlockedType>> pairs) {
+        // calculate block size distribution
+        Processable<Pair<String, Integer>> aggregated = pairs
+                .aggregate((Triple<String, BlockedType, BlockedType> record,
+                            DataIterator<Pair<String, Integer>> resultCollector) -> {
+                    resultCollector.next(new Pair<String, Integer>(record.getFirst(), 1));
+                }, new CountAggregator<>());
+
+        this.initializeBlockingResults();
+        int result_id = 0;
+
+        for (Pair<String, Integer> value : aggregated.sort((v) -> v.getSecond(), false).get()) {
+            Record model = new Record(Integer.toString(result_id));
+            model.setValue(AbstractBlocker.blockingKeyValue, value.getFirst().toString());
+            model.setValue(AbstractBlocker.frequency, value.getFirst().toString());
+            result_id += 1;
+
+            this.appendBlockingResult(model);
+        }
+    }
+    protected Processable<Aligner<BlockedType, AlignerType>> createAligners(
+            Processable<Triple<String, Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>>> pairsWithVectors) {
+        return pairsWithVectors.aggregate((
+                Triple<String, Pair<BlockedType, BlockingKeyIndexer<RecordType, SchemaElementType, BlockedType, AlignerType>.BlockingVector>, Pair<BlockedType, BlockingKeyIndexer<RecordType, SchemaElementType, BlockedType, AlignerType>.BlockingVector>> record,
+                DataIterator<Pair<Pair<Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>>, Pair<Double, Double>>> resultCollector) -> {
+            String dimension = record.getFirst();
+
+            BlockedType leftRecord = record.getSecond().getFirst();
+            BlockedType rightRecord = record.getThird().getFirst();
+
+            BlockingVector leftVector = record.getSecond().getSecond();
+            BlockingVector rightVector = record.getThird().getSecond();
+
+            Pair<Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>> key = new Pair<>(
+                    new LeftIdentityPair<>(leftRecord, leftVector), new LeftIdentityPair<>(rightRecord, rightVector));
+            Pair<Double, Double> value = new Pair<>(leftVector.get(dimension), rightVector.get(dimension));
+
+            resultCollector.next(new Pair<>(key, value));
+        }, new DataAggregator<Pair<Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>>, Pair<Double, Double>, Aligner<BlockedType, AlignerType>>() {
+
+
+            @Override
+            public Pair<Aligner<BlockedType, AlignerType>, Object> initialise(
+                    Pair<Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>> keyValue) {
+                return stateless(
+                        new Aligner<>(keyValue.getFirst().getFirst(), keyValue.getSecond().getFirst(), 0.0));
+            }
+
+            @Override
+            public Pair<Aligner<BlockedType, AlignerType>, Object> aggregate(
+                    Aligner<BlockedType, AlignerType> previousResult, Pair<Double, Double> record,
+                    Object state) {
+
+                Double leftEntry = record.getFirst();
+                Double rightEntry = record.getSecond();
+
+                double score = vectorSpaceSimilarity.calculateDimensionScore(leftEntry, rightEntry);
+
+                score = vectorSpaceSimilarity.aggregateDimensionScores(previousResult.getSimilarityScore(), score);
+
+                return stateless(new Aligner<BlockedType, AlignerType>(previousResult.getFirstRecordType(),
+                        previousResult.getSecondRecordType(), score, null));
+            }
+
+            @Override
+            public Pair<Aligner<BlockedType, AlignerType>, Object> merge(
+                    Pair<Aligner<BlockedType, AlignerType>, Object> intermediateResult1,
+                    Pair<Aligner<BlockedType, AlignerType>, Object> intermediateResult2) {
+
+                Aligner<BlockedType, AlignerType> c1 = intermediateResult1.getFirst();
+                Aligner<BlockedType, AlignerType> c2 = intermediateResult2.getFirst();
+
+                Aligner<BlockedType, AlignerType> result = new Aligner<>(c1.getFirstRecordType(),
+                        c1.getSecondRecordType(),
+                        vectorSpaceSimilarity.aggregateDimensionScores(c1.getSimilarityScore(), c2.getSimilarityScore()));
+
+                return stateless(result);
+            }
+
+            public Aligner<BlockedType, AlignerType> createFinalValue(
+                    Pair<Pair<BlockedType, BlockingVector>, Pair<BlockedType, BlockingVector>> keyValue,
+                    Aligner<BlockedType, AlignerType> result, Object state) {
+
+                BlockedType record1 = keyValue.getFirst().getFirst();
+                BlockedType record2 = keyValue.getSecond().getFirst();
+
+                BlockingVector leftVector = keyValue.getFirst().getSecond();
+                BlockingVector rightVector = keyValue.getSecond().getSecond();
+
+                double similarityScore = vectorSpaceSimilarity.normaliseScore(result.getSimilarityScore(), leftVector,
+                        rightVector);
+
+                if (similarityScore >= similarityThreshold) {
+                    Processable<Aligner<AlignerType, Matchable>> causes = createCausalAligners(
+                            record1, record2, leftVector, rightVector);
+
+                    return new Aligner<>(result.getFirstRecordType(), result.getSecondRecordType(), similarityScore,
+                            causes);
+                } else {
+                    return null;
+                }
+            }
+        }).map((Pair<Pair<Pair<BlockedType, BlockingKeyIndexer<RecordType, SchemaElementType, BlockedType, AlignerType>.BlockingVector>, Pair<BlockedType, BlockingKeyIndexer<RecordType, SchemaElementType, BlockedType, AlignerType>.BlockingVector>>, Aligner<BlockedType, AlignerType>> record,
+                DataIterator<Aligner<BlockedType, AlignerType>> resultCollector) -> {
+            resultCollector.next(record.getSecond());
+        });
+    }
 //
 //    public Processable<Pair<String, Double>> calculateInverseDocumentFrequencies(
 //            DataSet<RecordType, SchemaElementType> dataset,
